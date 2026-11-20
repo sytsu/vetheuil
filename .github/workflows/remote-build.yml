@@ -1,0 +1,122 @@
+# Build any GitHub repo's iOS app without adding CI to it.
+# Dispatch: gh api -X POST repos/sytsu/vetheuil/actions/workflows/remote-build.yml/dispatches \
+#             -f ref=main -f 'inputs[repo]=owner/name' [-f 'inputs[ref]=branch-or-sha'] ...
+# The IPA is published as a pre-release named build-<run id> in this repo.
+name: remote-build
+run-name: build ${{ inputs.repo }}@${{ inputs.ref || 'default branch' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: owner/name of the repo to build
+        required: true
+      ref:
+        description: branch, tag or commit (default branch if empty)
+        default: ""
+      container:
+        description: .xcodeproj or .xcworkspace path (auto-detected if empty)
+        default: ""
+      scheme:
+        description: scheme (auto-detected if empty)
+        default: ""
+      runner:
+        description: macOS runner label
+        default: macos-26
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 60
+    outputs:
+      scheme: ${{ steps.detect.outputs.scheme }}
+      sha: ${{ steps.detect.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: vetheuil
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          path: src
+          submodules: recursive
+          persist-credentials: false
+      - name: Detect
+        id: detect
+        working-directory: src
+        env:
+          IN_CONTAINER: ${{ inputs.container }}
+          IN_SCHEME: ${{ inputs.scheme }}
+        run: |
+          args=()
+          [ -n "$IN_CONTAINER" ] && args+=(--container "$IN_CONTAINER")
+          [ -n "$IN_SCHEME" ] && args+=(--scheme "$IN_SCHEME")
+          python3 ../vetheuil/vt.py detect "${args[@]}" | tee /tmp/detect.json
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json
+          d = json.load(open("/tmp/detect.json"))
+          print(f"kind={d['kind']}\ncontainer={d['container']}\nscheme={d['scheme']}\nsource={d['scheme_source']}")
+          EOF
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Shared scheme (if missing)
+        if: startsWith(steps.detect.outputs.source, 'missing')
+        working-directory: src
+        run: python3 ../vetheuil/vt.py scheme --project "${{ steps.detect.outputs.container }}"
+      - name: Build (unsigned)
+        working-directory: src
+        env:
+          KIND: ${{ steps.detect.outputs.kind }}
+          CONTAINER: ${{ steps.detect.outputs.container }}
+          SCHEME: ${{ steps.detect.outputs.scheme }}
+        run: |
+          xcodebuild -version
+          set +e
+          xcodebuild "-$KIND" "$CONTAINER" -scheme "$SCHEME" -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build > "$RUNNER_TEMP/build.log" 2>&1
+          status=$?
+          python3 ../vetheuil/vt.py digest "$RUNNER_TEMP/build.log" --markdown >> "$GITHUB_STEP_SUMMARY"
+          python3 ../vetheuil/vt.py digest "$RUNNER_TEMP/build.log"
+          exit $status
+      - name: Package IPA
+        env:
+          SCHEME: ${{ steps.detect.outputs.scheme }}
+        run: |
+          APP="$(find "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos" -maxdepth 1 -name '*.app' | head -1)"
+          test -n "$APP" || { echo "no .app built"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/out/Payload" && cp -R "$APP" "$RUNNER_TEMP/out/Payload/"
+          (cd "$RUNNER_TEMP/out" && zip -qry "$GITHUB_WORKSPACE/$SCHEME.ipa" Payload)
+          cp "$RUNNER_TEMP/build.log" "$GITHUB_WORKSPACE/build.log"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: remote-build
+          path: |
+            *.ipa
+            build.log
+          if-no-files-found: ignore
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: remote-build
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_IN: ${{ inputs.repo }}
+          SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          gh release create "build-$GITHUB_RUN_ID" ./*.ipa --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "$REPO_IN@${SHA::7}" \
+            --notes "Unsigned build of $REPO_IN at $SHA. Sign and install with SideStore or similar."
